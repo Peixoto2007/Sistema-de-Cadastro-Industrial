@@ -1,5 +1,6 @@
 from difflib import SequenceMatcher
 from ollama import chat
+from pathlib import Path
 import pandas as pd
 import json
 import logging
@@ -14,17 +15,25 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-ARQUIVO_PLANILHA = 'planilha.xlsx'
-ARQUIVO_SAIDA = 'planilha_resultado.xlsx'
 MODELO_IA = 'qwen2.5:1.5b'
 LIMITE_SIMILARES = 8
 LIMIAR_SIMILARIDADE = 0.55
-LIMIAR_AUTO_MATCH = 0.92
+LIMIAR_AUTO_MATCH = 0.88
+
+NOMES_ABA_ENTRADA = {'sheet1', 'planilha1', 'pagina1', 'página1'}
+NOMES_ABA_BANCO = {'banco', 'base', 'materiais'}
+
+COLUNAS_SAIDA = [
+    'cadastro sugerido',
+    'codigo do material',
+    'ncm sugerido',
+    'status',
+]
 
 OLLAMA_OPTIONS = {
-    'num_predict': 80,
+    'num_predict': 150,
     'temperature': 0.1,
-    'num_ctx': 2048,
+    'num_ctx': 4096,
 }
 
 
@@ -52,24 +61,87 @@ def normalizar(texto):
     return texto.strip()
 
 
-def similaridade(a, b):
-    return SequenceMatcher(None, normalizar(a), normalizar(b)).ratio()
+def formatar_codigo(valor):
+    if pd.isna(valor) or str(valor).strip() == '':
+        return ''
+    try:
+        numero = float(valor)
+        if numero == int(numero):
+            return str(int(numero))
+    except (TypeError, ValueError):
+        pass
+    return str(valor).strip()
 
 
-def carregar_banco(arquivo):
-    dados = pd.read_excel(arquivo, sheet_name=None)
-    planilha = dados['Sheet1']
-    banco = dados['banco']
+def engine_planilha(arquivo):
+    extensao = Path(arquivo).suffix.lower()
+    if extensao == '.ods':
+        return 'odf'
+    return 'openpyxl'
 
-    planilha.columns = planilha.columns.str.strip().str.lower()
+
+def encontrar_planilha():
+    pasta = Path('.')
+    for nome in ('planilha.ods', 'planilha.xlsx', 'planilha.xls'):
+        caminho = pasta / nome
+        if caminho.exists():
+            return str(caminho)
+    raise FileNotFoundError(
+        'Planilha não encontrada. Coloque planilha.ods ou planilha.xlsx na pasta do sistema.'
+    )
+
+
+def resolver_abas(dados):
+    mapa = {nome.lower(): nome for nome in dados.keys()}
+
+    aba_banco = next((mapa[n] for n in NOMES_ABA_BANCO if n in mapa), None)
+    aba_entrada = next((mapa[n] for n in NOMES_ABA_ENTRADA if n in mapa), None)
+
+    if aba_entrada is None:
+        for nome in dados:
+            if nome != aba_banco:
+                aba_entrada = nome
+                break
+
+    if aba_banco is None:
+        raise ValueError('Aba "banco" não encontrada na planilha.')
+
+    if aba_entrada is None:
+        raise ValueError('Aba de entrada (materiais) não encontrada na planilha.')
+
+    return aba_entrada, aba_banco
+
+
+def normalizar_colunas_banco(banco):
     banco.columns = banco.columns.str.strip().str.lower()
+
+    if 'codigo' not in banco.columns:
+        for candidato in ('codigos', 'código', 'cod'):
+            if candidato in banco.columns:
+                banco['codigo'] = banco[candidato]
+                break
 
     for coluna in ('codigo', 'ncm', 'tipo'):
         if coluna not in banco.columns:
             banco[coluna] = ''
 
+    banco['codigo'] = banco['codigo'].apply(formatar_codigo)
     banco['material_norm'] = banco['material'].apply(normalizar)
-    return planilha, banco
+    return banco
+
+
+def carregar_banco(arquivo):
+    engine = engine_planilha(arquivo)
+    dados = pd.read_excel(arquivo, sheet_name=None, engine=engine)
+    aba_entrada, aba_banco = resolver_abas(dados)
+
+    planilha = dados[aba_entrada].copy()
+    banco = dados[aba_banco].copy()
+
+    planilha.columns = planilha.columns.str.strip().str.lower()
+    banco = normalizar_colunas_banco(banco)
+
+    return planilha, banco, arquivo, engine, aba_entrada, aba_banco
 
 
 def buscar_exato(descricao, banco):
@@ -99,8 +171,8 @@ def formatar_similares(similares_com_score):
     linhas = []
     for _, linha in similares_com_score:
         linhas.append(
-            f"{linha.get('codigo', '')} | {linha.get('material', '')} | "
-            f"{linha.get('ncm', '')} | {linha.get('tipo', '')}"
+            f"CODIGO {linha.get('codigo', '')} | {linha.get('material', '')} | "
+            f"NCM {linha.get('ncm', '')} | TIPO {linha.get('tipo', '')}"
         )
     return '\n'.join(linhas)
 
@@ -113,7 +185,7 @@ def interpretar_resposta_ia(conteudo):
     dados = json.loads(match.group(0))
     return {
         'status': str(dados.get('status', 'NOVO')).upper(),
-        'codigo': str(dados.get('codigo', '')).strip(),
+        'codigo': formatar_codigo(dados.get('codigo', '')),
         'cadastro': str(dados.get('cadastro', '')).strip(),
         'ncm': str(dados.get('ncm', '')).strip(),
         'tipo': str(dados.get('tipo', '')).strip(),
@@ -121,16 +193,37 @@ def interpretar_resposta_ia(conteudo):
 
 
 def montar_prompt(descricao, similares_com_score):
-    return f"""Classifique o material abaixo.
+    return f"""Você decifra nomes abreviados de materiais industriais em português brasileiro.
 
-Item: {descricao}
+TAREFA: expandir abreviações da nota fiscal para o nome completo de cadastro da empresa.
 
-Referências do banco:
+REGRA PRINCIPAL: NUNCA repita o texto da nota. Sempre escreva o nome por extenso.
+
+Exemplos corretos:
+- "Pont. 200V retific." -> "Ponte retificadora 200V"
+- "tubo ret 10x30mm" -> "Tubo reto 10x30mm"
+- "Cab. pp 70mm" -> "Cabo polipropileno 70mm"
+- "Bomb. pneum s/bc pt" -> "Bomba pneumatica sem boca preta"
+- "cont. 24v/220w" -> "Contator 24V 220W"
+- "paraf sext 1/4" -> "Parafuso sextavado 1/4"
+- "tubo pa 6" -> "Tubo PA 6"
+- "Desinfetante alf. 12/500" -> "Desinfetante alfazema 12x500ml"
+
+Abreviações comuns:
+Pont.=Ponte, retific.=retificadora, ret=reto, Cab.=Cabo, pp=polipropileno,
+Bomb.=Bomba, pneum.=pneumatica, cont.=contator, paraf.=parafuso,
+sext.=sextavado, alf.=alfazema, galv.=galvanizado, s/=sem, c/=com.
+
+Item da nota: {descricao}
+
+Materiais parecidos no banco da empresa:
 {formatar_similares(similares_com_score)}
 
-Retorne JSON: {{"status":"JA_EXISTE|NOVO","codigo":"","cadastro":"","ncm":"","tipo":""}}
-Regras: JA_EXISTE=só se for o mesmo material; codigo preenchido, cadastro vazio.
-NOVO=cadastro completo + ncm + tipo (UN/KG/MT/L/PC/CX/RL). Responda só JSON, sem markdown."""
+Se o item JÁ EXISTE no banco (mesmo produto), use status JA_EXISTE, preencha codigo e deixe cadastro vazio.
+Se é material NOVO, use status NOVO, expanda o nome em cadastro, sugira ncm e tipo (UN/KG/MT/L/PC/CX/RL).
+
+Responda APENAS JSON puro:
+{{"status":"JA_EXISTE ou NOVO","codigo":"","cadastro":"","ncm":"","tipo":""}}"""
 
 
 def preaquecer_modelo():
@@ -160,16 +253,67 @@ def consultar_ia(descricao, similares_com_score):
             print('.', end='', flush=True)
     print()
 
-    return interpretar_resposta_ia(conteudo.strip())
+    resultado = interpretar_resposta_ia(conteudo.strip())
+    return corrigir_cadastro_copiado(descricao, resultado)
+
+
+def cadastro_parece_copia(descricao, cadastro):
+    if not cadastro:
+        return True
+    desc_norm = normalizar(descricao)
+    cad_norm = normalizar(cadastro)
+    if desc_norm == cad_norm:
+        return True
+    return SequenceMatcher(None, desc_norm, cad_norm).ratio() >= 0.82
+
+
+def expandir_abreviacoes_basicas(descricao):
+    texto = str(descricao).strip()
+    substituicoes = [
+        (r'\bPont\.?\s*', 'Ponte '),
+        (r'\bretific\.?\s*', 'retificadora '),
+        (r'\bret\b(?=\s+\d|\s+\d+x|\s*$)', 'reto'),
+        (r'\bCab\.?\s*', 'Cabo '),
+        (r'\bpp\b', 'polipropileno'),
+        (r'\bBomb\.?\s*', 'Bomba '),
+        (r'\bpneum\.?\s*', 'pneumatica '),
+        (r'\bcont\.?\s*', 'Contator '),
+        (r'\bparaf\.?\s*', 'Parafuso '),
+        (r'\bsext\.?\s*', 'sextavado '),
+        (r'\balf\.?\s*', 'alfazema '),
+        (r'\bgalv\.?\s*', 'galvanizado '),
+        (r'\btubo\b', 'Tubo'),
+        (r'\bs/\b', 'sem '),
+        (r'\bc/\b', 'com '),
+    ]
+    for padrao, substituto in substituicoes:
+        texto = re.sub(padrao, substituto, texto, flags=re.IGNORECASE)
+    texto = re.sub(r'\s+', ' ', texto).strip().rstrip('.')
+    if texto:
+        return texto[0].upper() + texto[1:]
+    return texto
+
+
+def corrigir_cadastro_copiado(descricao, resultado):
+    if resultado['status'] != 'NOVO':
+        return resultado
+    if not cadastro_parece_copia(descricao, resultado['cadastro']):
+        return resultado
+
+    expandido = expandir_abreviacoes_basicas(descricao)
+    if expandido and not cadastro_parece_copia(descricao, expandido):
+        resultado['cadastro'] = expandido
+        log.info('Cadastro corrigido por regras: %s', expandido)
+    return resultado
 
 
 def resultado_de_linha(linha, status='JA_EXISTE'):
     return {
         'status': status,
-        'codigo': str(linha.get('codigo', '')).strip(),
+        'codigo': formatar_codigo(linha.get('codigo', '')),
         'cadastro': '',
-        'ncm': str(linha.get('ncm', '')).strip(),
-        'tipo': str(linha.get('tipo', '')).strip(),
+        'ncm': str(linha.get('ncm', '')).strip() if not pd.isna(linha.get('ncm', '')) else '',
+        'tipo': str(linha.get('tipo', '')).strip() if not pd.isna(linha.get('tipo', '')) else '',
     }
 
 
@@ -219,9 +363,9 @@ def processar_material(descricao, banco, cache=None):
         metricas['ollama'] = time.perf_counter() - t0
         metricas['origem'] = 'erro'
         resultado = {
-            'status': 'ERRO',
+            'status': 'NOVO',
             'codigo': '',
-            'cadastro': str(descricao).upper(),
+            'cadastro': expandir_abreviacoes_basicas(descricao) or str(descricao).upper(),
             'ncm': '',
             'tipo': '',
         }
@@ -232,61 +376,65 @@ def processar_material(descricao, banco, cache=None):
     return resultado, metricas
 
 
-def montar_resultado(resultado):
-    if resultado['status'] == 'JA_EXISTE' and resultado['codigo']:
-        partes = [f"CODIGO: {resultado['codigo']}"]
-        if resultado['ncm']:
-            partes.append(f"NCM: {resultado['ncm']}")
-        if resultado['tipo']:
-            partes.append(f"TIPO: {resultado['tipo']}")
-        return ' | '.join(partes)
+def preparar_colunas_saida(planilha):
+    for coluna in COLUNAS_SAIDA:
+        if coluna not in planilha.columns:
+            planilha[coluna] = ''
+        planilha[coluna] = planilha[coluna].astype('object')
+    return planilha
 
-    partes = []
-    if resultado['cadastro']:
-        partes.append(resultado['cadastro'])
-    if resultado['ncm']:
-        partes.append(f"NCM: {resultado['ncm']}")
-    if resultado['tipo']:
-        partes.append(f"TIPO: {resultado['tipo']}")
-    return ' | '.join(partes) if partes else ''
+
+def gravar_resultado(planilha, posicao, resultado):
+    if resultado['status'] == 'JA_EXISTE':
+        planilha.at[posicao, 'codigo do material'] = resultado['codigo']
+        planilha.at[posicao, 'cadastro sugerido'] = ''
+        planilha.at[posicao, 'ncm sugerido'] = resultado['ncm']
+        planilha.at[posicao, 'status'] = 'JA_EXISTE'
+    else:
+        planilha.at[posicao, 'codigo do material'] = ''
+        planilha.at[posicao, 'cadastro sugerido'] = resultado['cadastro']
+        planilha.at[posicao, 'ncm sugerido'] = resultado['ncm']
+        planilha.at[posicao, 'status'] = resultado['status']
 
 
 def main():
     cache = {}
 
     with Timer('carregar_banco') as timer_banco:
-        planilha, banco = carregar_banco(ARQUIVO_PLANILHA)
+        arquivo = encontrar_planilha()
+        planilha, banco, arquivo, engine, aba_entrada, aba_banco = carregar_banco(arquivo)
+
+    log.info('Planilha: %s (mesma planilha será atualizada)', arquivo)
+    log.info('Feche o LibreOffice Calc antes de rodar, se a planilha estiver aberta.')
+
+    planilha.reset_index(drop=True, inplace=True)
+    preparar_colunas_saida(planilha)
 
     preaquecer_modelo()
 
-    for coluna in ('cadastro sugerido', 'codigo', 'ncm sugerido', 'tipo', 'status', 'resultado'):
-        if coluna not in planilha.columns:
-            planilha[coluna] = ''
+    for posicao, row in planilha.iterrows():
+        descricao = row['material']
 
-    for i, descricao in enumerate(planilha['material']):
         if pd.isna(descricao) or not str(descricao).strip():
             continue
 
-        log.info('Processando [%d]: %s', i, descricao)
+        log.info('Processando [%d]: %s', posicao, descricao)
         resultado, metricas = processar_material(descricao, banco, cache=cache)
+        gravar_resultado(planilha, posicao, resultado)
 
-        planilha.loc[i, 'status'] = resultado['status']
-        planilha.loc[i, 'codigo'] = resultado['codigo']
-        planilha.loc[i, 'cadastro sugerido'] = resultado['cadastro']
-        planilha.loc[i, 'ncm sugerido'] = resultado['ncm']
-        planilha.loc[i, 'tipo'] = resultado['tipo']
-        planilha.loc[i, 'resultado'] = montar_resultado(resultado)
-
-        log.info('%s -> %s', descricao, planilha.loc[i, 'resultado'])
+        if resultado['status'] == 'JA_EXISTE':
+            log.info('%s -> CODIGO: %s', descricao, resultado['codigo'])
+        else:
+            log.info('%s -> %s', descricao, resultado['cadastro'])
 
     with Timer('salvar_planilha'):
-        with pd.ExcelWriter(ARQUIVO_SAIDA, engine='openpyxl') as writer:
-            planilha.to_excel(writer, sheet_name='Sheet1', index=False)
+        with pd.ExcelWriter(arquivo, engine=engine) as writer:
+            planilha.to_excel(writer, sheet_name=aba_entrada, index=False)
             banco.drop(columns=['material_norm'], errors='ignore').to_excel(
-                writer, sheet_name='banco', index=False
+                writer, sheet_name=aba_banco, index=False
             )
 
-    log.info('Finalizado. Saída: %s | carregar_banco: %.2fs', ARQUIVO_SAIDA, timer_banco.elapsed)
+    log.info('Finalizado. Planilha atualizada: %s | carregar_banco: %.2fs', arquivo, timer_banco.elapsed)
 
 
 if __name__ == '__main__':
