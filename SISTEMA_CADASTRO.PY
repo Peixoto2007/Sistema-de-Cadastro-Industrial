@@ -1,5 +1,6 @@
 from difflib import SequenceMatcher
 from ollama import chat
+from openpyxl import load_workbook
 from pathlib import Path
 import pandas as pd
 import json
@@ -18,17 +19,22 @@ log = logging.getLogger(__name__)
 MODELO_IA = 'qwen2.5:1.5b'
 LIMITE_SIMILARES = 8
 LIMIAR_SIMILARIDADE = 0.55
-LIMIAR_AUTO_MATCH = 0.88
+LIMIAR_AUTO_MATCH = 0.78
+LIMIAR_MATCH_FORTE = 0.70
+LINHA_CABECALHO = 1
+
+UNIDADES_MEDIDA = {'UN', 'MT', 'PC', 'KG', 'CX', 'RL', 'LT', 'L', 'M', 'M2', 'M3', 'GL', 'PAR'}
 
 NOMES_ABA_ENTRADA = {'sheet1', 'planilha1', 'pagina1', 'página1'}
 NOMES_ABA_BANCO = {'banco', 'base', 'materiais'}
 
-COLUNAS_SAIDA = [
-    'cadastro sugerido',
-    'codigo do material',
-    'ncm sugerido',
-    'status',
-]
+MAPEAMENTO_COLUNAS_SAIDA = {
+    'cadastro sugerido': ['cadastro sugerido'],
+    'codigo existente': ['codigo existente', 'codigo do material', 'codigo'],
+    'ncm sugerido': ['ncm sugerido'],
+    'tipo sugerido': ['tipo sugerido', 'tipo'],
+    'status': ['status'],
+}
 
 OLLAMA_OPTIONS = {
     'num_predict': 150,
@@ -61,6 +67,12 @@ def normalizar(texto):
     return texto.strip()
 
 
+def normalizar_cabecalho(texto):
+    if texto is None or (isinstance(texto, float) and pd.isna(texto)):
+        return ''
+    return str(texto).strip().lower()
+
+
 def formatar_codigo(valor):
     if pd.isna(valor) or str(valor).strip() == '':
         return ''
@@ -70,7 +82,77 @@ def formatar_codigo(valor):
             return str(int(numero))
     except (TypeError, ValueError):
         pass
-    return str(valor).strip()
+    texto = str(valor).strip()
+    if parece_unidade(texto):
+        return ''
+    return texto
+
+
+def parece_unidade(valor):
+    if pd.isna(valor) or str(valor).strip() == '':
+        return False
+    texto = str(valor).strip().upper()
+    return len(texto) <= 3 and texto.isalpha() and texto in UNIDADES_MEDIDA
+
+
+def codigo_valido(valor):
+    codigo = formatar_codigo(valor)
+    if not codigo or parece_unidade(codigo):
+        return False
+    return codigo.isdigit()
+
+
+def formatar_valor_campo(valor, padrao=''):
+    if pd.isna(valor):
+        return padrao
+    texto = str(valor).strip()
+    if texto.lower() in ('nan', 'none', 'null', '<na>'):
+        return padrao
+    return texto
+
+
+def validar_ncm(valor):
+    texto = formatar_valor_campo(valor)
+    if not texto:
+        return ''
+    texto = re.sub(r'^ncm\s*', '', texto, flags=re.IGNORECASE).strip()
+    if texto.lower() in ('nan', 'none'):
+        return ''
+    if re.search(r'[a-zA-Z]{4,}', texto):
+        return ''
+    digitos = re.sub(r'[^\d]', '', texto)
+    if 6 <= len(digitos) <= 10:
+        return digitos
+    return ''
+
+
+def limpar_valor_ia(valor, tipo_campo='texto'):
+    if pd.isna(valor):
+        return ''
+    texto = str(valor).strip()
+    if texto.lower() in ('nan', 'none', 'null', ''):
+        return ''
+    if re.match(r'^(ncm|tipo)\s+nan$', texto, re.IGNORECASE):
+        return ''
+    if tipo_campo in ('ncm', 'tipo') and texto.lower().startswith(f'{tipo_campo} '):
+        texto = texto.split(' ', 1)[1].strip()
+        if texto.lower() == 'nan':
+            return ''
+
+    if tipo_campo == 'ncm':
+        return validar_ncm(texto)
+    if tipo_campo == 'tipo':
+        texto = texto.upper()
+        return texto if parece_unidade(texto) else ''
+    if tipo_campo == 'codigo':
+        return formatar_codigo(texto) if codigo_valido(texto) else ''
+    return texto
+
+
+def valor_celula(valor):
+    if valor is None or valor == '':
+        return None
+    return valor
 
 
 def engine_planilha(arquivo):
@@ -112,36 +194,97 @@ def resolver_abas(dados):
     return aba_entrada, aba_banco
 
 
+def cabecalhos_da_planilha(df):
+    return [str(col).strip() if not pd.isna(col) else '' for col in df.columns]
+
+
+def encontrar_coluna_por_aliases(cabecalhos, aliases):
+    norm_para_indice = {}
+    for indice, cabecalho in enumerate(cabecalhos):
+        norm = normalizar_cabecalho(cabecalho)
+        if norm and norm not in norm_para_indice:
+            norm_para_indice[norm] = indice
+
+    for alias in aliases:
+        indice = norm_para_indice.get(alias)
+        if indice is not None:
+            return indice
+    return None
+
+
+def mapear_colunas_saida(cabecalhos):
+    mapa = {}
+    for canonico, aliases in MAPEAMENTO_COLUNAS_SAIDA.items():
+        indice = encontrar_coluna_por_aliases(cabecalhos, aliases)
+        if indice is not None:
+            mapa[canonico] = indice + 1
+    return mapa
+
+
+def mapear_colunas_saida_openpyxl(ws):
+    cabecalhos = [
+        ws.cell(row=LINHA_CABECALHO, column=col).value
+        for col in range(1, ws.max_column + 1)
+    ]
+    return mapear_colunas_saida(cabecalhos)
+
+
 def normalizar_colunas_banco(banco):
     banco.columns = banco.columns.str.strip().str.lower()
 
-    if 'codigo' not in banco.columns:
-        for candidato in ('codigos', 'código', 'cod'):
-            if candidato in banco.columns:
-                banco['codigo'] = banco[candidato]
-                break
-
-    for coluna in ('codigo', 'ncm', 'tipo'):
+    for coluna in ('codigos', 'codigo', 'ncm', 'tipo', 'material'):
         if coluna not in banco.columns:
             banco[coluna] = ''
 
-    banco['codigo'] = banco['codigo'].apply(formatar_codigo)
+    codigos_resolvidos = []
+    tipos_resolvidos = []
+
+    for _, linha in banco.iterrows():
+        codigo_numerico = formatar_codigo(linha.get('codigos'))
+        if not codigo_valido(codigo_numerico):
+            candidato = formatar_codigo(linha.get('codigo'))
+            if codigo_valido(candidato):
+                codigo_numerico = candidato
+
+        tipo = formatar_valor_campo(linha.get('tipo'))
+        if tipo and not parece_unidade(tipo):
+            tipo = ''
+
+        if not tipo and parece_unidade(linha.get('codigo')):
+            tipo = str(linha.get('codigo')).strip().upper()
+
+        codigos_resolvidos.append(codigo_numerico)
+        tipos_resolvidos.append(tipo)
+
+    banco['codigo'] = codigos_resolvidos
+    banco['tipo'] = tipos_resolvidos
     banco['material_norm'] = banco['material'].apply(normalizar)
     return banco
 
 
-def carregar_banco(arquivo):
+def carregar_dados(arquivo):
     engine = engine_planilha(arquivo)
     dados = pd.read_excel(arquivo, sheet_name=None, engine=engine)
     aba_entrada, aba_banco = resolver_abas(dados)
 
-    planilha = dados[aba_entrada].copy()
+    planilha = dados[aba_entrada]
     banco = dados[aba_banco].copy()
-
-    planilha.columns = planilha.columns.str.strip().str.lower()
     banco = normalizar_colunas_banco(banco)
 
-    return planilha, banco, arquivo, engine, aba_entrada, aba_banco
+    cabecalhos = cabecalhos_da_planilha(planilha)
+    col_material = encontrar_coluna_por_aliases(cabecalhos, ['material'])
+    if col_material is None:
+        raise ValueError('Coluna "material" não encontrada na aba de entrada.')
+
+    mapa_colunas_saida = mapear_colunas_saida(cabecalhos)
+    faltando = set(MAPEAMENTO_COLUNAS_SAIDA) - set(mapa_colunas_saida)
+    if faltando:
+        log.warning(
+            'Colunas de saída não encontradas na planilha (serão ignoradas na gravação): %s',
+            ', '.join(sorted(faltando)),
+        )
+
+    return planilha, banco, arquivo, aba_entrada, aba_banco, col_material, mapa_colunas_saida
 
 
 def buscar_exato(descricao, banco):
@@ -164,15 +307,44 @@ def buscar_similares(descricao, banco, limite=LIMITE_SIMILARES):
     return scores[:limite]
 
 
+def variacoes_descricao(descricao):
+    opcoes = [descricao]
+    expandido = expandir_abreviacoes_basicas(descricao)
+    if expandido and normalizar(expandido) != normalizar(descricao):
+        opcoes.append(expandido)
+    return opcoes
+
+
+def buscar_melhor_match(descricao, banco):
+    for variacao in variacoes_descricao(descricao):
+        exato = buscar_exato(variacao, banco)
+        if exato is not None:
+            return exato, 1.0, 'exato'
+
+    melhor_score = 0.0
+    melhor_linha = None
+    for variacao in variacoes_descricao(descricao):
+        for score, linha in buscar_similares(variacao, banco):
+            if score > melhor_score:
+                melhor_score = score
+                melhor_linha = linha
+
+    return melhor_linha, melhor_score, 'similar'
+
+
 def formatar_similares(similares_com_score):
     if not similares_com_score:
         return 'Nenhum material parecido encontrado.'
 
     linhas = []
     for _, linha in similares_com_score:
+        codigo = formatar_valor_campo(linha.get('codigo', ''))
+        material = formatar_valor_campo(linha.get('material', ''))
+        ncm = formatar_valor_campo(validar_ncm(linha.get('ncm', '')))
+        tipo = formatar_valor_campo(linha.get('tipo', ''))
         linhas.append(
-            f"CODIGO {linha.get('codigo', '')} | {linha.get('material', '')} | "
-            f"NCM {linha.get('ncm', '')} | TIPO {linha.get('tipo', '')}"
+            f"CODIGO {codigo or '-'} | {material or '-'} | "
+            f"NCM {ncm or '-'} | TIPO {tipo or '-'}"
         )
     return '\n'.join(linhas)
 
@@ -185,10 +357,10 @@ def interpretar_resposta_ia(conteudo):
     dados = json.loads(match.group(0))
     return {
         'status': str(dados.get('status', 'NOVO')).upper(),
-        'codigo': formatar_codigo(dados.get('codigo', '')),
-        'cadastro': str(dados.get('cadastro', '')).strip(),
-        'ncm': str(dados.get('ncm', '')).strip(),
-        'tipo': str(dados.get('tipo', '')).strip(),
+        'codigo': limpar_valor_ia(dados.get('codigo', ''), 'codigo'),
+        'cadastro': limpar_valor_ia(dados.get('cadastro', ''), 'texto'),
+        'ncm': limpar_valor_ia(dados.get('ncm', ''), 'ncm'),
+        'tipo': limpar_valor_ia(dados.get('tipo', ''), 'tipo'),
     }
 
 
@@ -278,6 +450,9 @@ def expandir_abreviacoes_basicas(descricao):
         (r'\bBomb\.?\s*', 'Bomba '),
         (r'\bpneum\.?\s*', 'pneumatica '),
         (r'\bcont\.?\s*', 'Contator '),
+        (r'\bRol\.?\s*', 'Rolamento '),
+        (r'\besfe\.?\s*', 'esferas '),
+        (r'\brad\.?\s*', 'radial '),
         (r'\bparaf\.?\s*', 'Parafuso '),
         (r'\bsext\.?\s*', 'sextavado '),
         (r'\balf\.?\s*', 'alfazema '),
@@ -308,12 +483,21 @@ def corrigir_cadastro_copiado(descricao, resultado):
 
 
 def resultado_de_linha(linha, status='JA_EXISTE'):
+    codigo = formatar_codigo(linha.get('codigo', ''))
+    if not codigo_valido(codigo):
+        codigo = ''
+
+    ncm = validar_ncm(linha.get('ncm', ''))
+    tipo = formatar_valor_campo(linha.get('tipo', ''))
+    if tipo and not parece_unidade(tipo):
+        tipo = ''
+
     return {
         'status': status,
-        'codigo': formatar_codigo(linha.get('codigo', '')),
+        'codigo': codigo,
         'cadastro': '',
-        'ncm': str(linha.get('ncm', '')).strip() if not pd.isna(linha.get('ncm', '')) else '',
-        'tipo': str(linha.get('tipo', '')).strip() if not pd.isna(linha.get('tipo', '')) else '',
+        'ncm': ncm,
+        'tipo': tipo.upper() if tipo else '',
     }
 
 
@@ -326,32 +510,51 @@ def processar_material(descricao, banco, cache=None):
         return cache[desc_norm], {'cache': True}
 
     t0 = time.perf_counter()
-    exato = buscar_exato(descricao, banco)
+    melhor_linha, melhor_score, origem_busca = buscar_melhor_match(descricao, banco)
     metricas['buscar_exato'] = time.perf_counter() - t0
+    metricas['buscar_similares'] = 0.0
 
-    if exato is not None:
-        metricas['buscar_similares'] = 0.0
+    if melhor_linha is not None and origem_busca == 'exato':
         metricas['ollama'] = 0.0
         metricas['origem'] = 'exato'
-        resultado = resultado_de_linha(exato)
+        resultado = resultado_de_linha(melhor_linha)
         if cache is not None:
             cache[desc_norm] = resultado
         log.info('METRICAS %s: %s', descricao[:40], metricas)
         return resultado, metricas
 
-    t0 = time.perf_counter()
+    if melhor_linha is not None and codigo_valido(melhor_linha.get('codigo', '')):
+        if melhor_score >= LIMIAR_AUTO_MATCH:
+            metricas['ollama'] = 0.0
+            metricas['origem'] = f'auto_match ({melhor_score:.2f})'
+            resultado = resultado_de_linha(melhor_linha)
+            if cache is not None:
+                cache[desc_norm] = resultado
+            log.info('METRICAS %s: %s', descricao[:40], metricas)
+            return resultado, metricas
+
+        if melhor_score >= LIMIAR_MATCH_FORTE:
+            metricas['ollama'] = 0.0
+            metricas['origem'] = f'match_forte ({melhor_score:.2f})'
+            resultado = resultado_de_linha(melhor_linha)
+            if cache is not None:
+                cache[desc_norm] = resultado
+            log.info('METRICAS %s: %s', descricao[:40], metricas)
+            return resultado, metricas
+
     similares_com_score = buscar_similares(descricao, banco)
+    expandido = expandir_abreviacoes_basicas(descricao)
+    if expandido and normalizar(expandido) != normalizar(descricao):
+        similares_expandido = buscar_similares(expandido, banco)
+        similares_com_score = sorted(
+            {
+                (s, l['material'], l['codigo']): (s, l)
+                for s, l in similares_com_score + similares_expandido
+            }.values(),
+            key=lambda item: item[0],
+            reverse=True,
+        )[:LIMITE_SIMILARES]
     metricas['buscar_similares'] = time.perf_counter() - t0
-
-    if similares_com_score and similares_com_score[0][0] >= LIMIAR_AUTO_MATCH:
-        score, top = similares_com_score[0]
-        metricas['ollama'] = 0.0
-        metricas['origem'] = f'auto_match ({score:.2f})'
-        resultado = resultado_de_linha(top)
-        if cache is not None:
-            cache[desc_norm] = resultado
-        log.info('METRICAS %s: %s', descricao[:40], metricas)
-        return resultado, metricas
 
     try:
         t0 = time.perf_counter()
@@ -376,51 +579,94 @@ def processar_material(descricao, banco, cache=None):
     return resultado, metricas
 
 
-def preparar_colunas_saida(planilha):
-    for coluna in COLUNAS_SAIDA:
-        if coluna not in planilha.columns:
-            planilha[coluna] = ''
-        planilha[coluna] = planilha[coluna].astype('object')
-    return planilha
+def montar_valores_saida(resultado):
+    codigo = resultado['codigo']
+    if not codigo_valido(codigo):
+        codigo = ''
 
-
-def gravar_resultado(planilha, posicao, resultado):
     if resultado['status'] == 'JA_EXISTE':
-        planilha.at[posicao, 'codigo do material'] = resultado['codigo']
-        planilha.at[posicao, 'cadastro sugerido'] = ''
-        planilha.at[posicao, 'ncm sugerido'] = resultado['ncm']
-        planilha.at[posicao, 'status'] = 'JA_EXISTE'
-    else:
-        planilha.at[posicao, 'codigo do material'] = ''
-        planilha.at[posicao, 'cadastro sugerido'] = resultado['cadastro']
-        planilha.at[posicao, 'ncm sugerido'] = resultado['ncm']
-        planilha.at[posicao, 'status'] = resultado['status']
+        return {
+            'cadastro sugerido': None,
+            'codigo existente': valor_celula(codigo),
+            'ncm sugerido': valor_celula(validar_ncm(resultado['ncm'])),
+            'tipo sugerido': valor_celula(resultado['tipo']),
+            'status': 'JA_EXISTE',
+        }
+
+    return {
+        'cadastro sugerido': valor_celula(resultado['cadastro']),
+        'codigo existente': None,
+        'ncm sugerido': valor_celula(validar_ncm(resultado['ncm'])),
+        'tipo sugerido': valor_celula(resultado['tipo']),
+        'status': valor_celula(resultado['status']),
+    }
+
+
+def salvar_resultados_preservando_formato(arquivo, aba_entrada, resultados, mapa_colunas_saida):
+    extensao = Path(arquivo).suffix.lower()
+    if extensao == '.ods':
+        log.error(
+            'Gravação com formatação preservada não suporta .ods. '
+            'Salve a planilha como .xlsx no LibreOffice Calc e rode novamente.'
+        )
+        return False
+
+    if extensao != '.xlsx':
+        log.error('Formato %s não suportado para gravação preservando formatação.', extensao)
+        return False
+
+    wb = load_workbook(arquivo)
+    if aba_entrada not in wb.sheetnames:
+        raise ValueError(f'Aba "{aba_entrada}" não encontrada no arquivo Excel.')
+
+    ws = wb[aba_entrada]
+    mapa_openpyxl = mapear_colunas_saida_openpyxl(ws)
+    colunas_gravar = {
+        canonico: mapa_openpyxl[canonico]
+        for canonico in mapa_colunas_saida
+        if canonico in mapa_openpyxl
+    }
+
+    for linha_idx, valores in resultados.items():
+        linha_excel = linha_idx + LINHA_CABECALHO + 1
+        for coluna_canonica, coluna_excel in colunas_gravar.items():
+            ws.cell(row=linha_excel, column=coluna_excel).value = valores.get(coluna_canonica)
+
+    wb.save(arquivo)
+    return True
 
 
 def main():
     cache = {}
+    resultados = {}
 
     with Timer('carregar_banco') as timer_banco:
         arquivo = encontrar_planilha()
-        planilha, banco, arquivo, engine, aba_entrada, aba_banco = carregar_banco(arquivo)
+        (
+            planilha,
+            banco,
+            arquivo,
+            aba_entrada,
+            aba_banco,
+            col_material,
+            mapa_colunas_saida,
+        ) = carregar_dados(arquivo)
 
-    log.info('Planilha: %s (mesma planilha será atualizada)', arquivo)
+    log.info('Planilha: %s (somente células de saída serão atualizadas)', arquivo)
     log.info('Feche o LibreOffice Calc antes de rodar, se a planilha estiver aberta.')
-
-    planilha.reset_index(drop=True, inplace=True)
-    preparar_colunas_saida(planilha)
+    log.info('Aba banco "%s" é somente leitura e não será modificada.', aba_banco)
 
     preaquecer_modelo()
 
-    for posicao, row in planilha.iterrows():
-        descricao = row['material']
+    for posicao in range(len(planilha)):
+        descricao = planilha.iloc[posicao, col_material]
 
         if pd.isna(descricao) or not str(descricao).strip():
             continue
 
         log.info('Processando [%d]: %s', posicao, descricao)
         resultado, metricas = processar_material(descricao, banco, cache=cache)
-        gravar_resultado(planilha, posicao, resultado)
+        resultados[posicao] = montar_valores_saida(resultado)
 
         if resultado['status'] == 'JA_EXISTE':
             log.info('%s -> CODIGO: %s', descricao, resultado['codigo'])
@@ -428,13 +674,18 @@ def main():
             log.info('%s -> %s', descricao, resultado['cadastro'])
 
     with Timer('salvar_planilha'):
-        with pd.ExcelWriter(arquivo, engine=engine) as writer:
-            planilha.to_excel(writer, sheet_name=aba_entrada, index=False)
-            banco.drop(columns=['material_norm'], errors='ignore').to_excel(
-                writer, sheet_name=aba_banco, index=False
-            )
+        salvo = salvar_resultados_preservando_formato(
+            arquivo, aba_entrada, resultados, mapa_colunas_saida
+        )
 
-    log.info('Finalizado. Planilha atualizada: %s | carregar_banco: %.2fs', arquivo, timer_banco.elapsed)
+    if salvo:
+        log.info(
+            'Finalizado. Planilha atualizada (formatação preservada): %s | carregar_banco: %.2fs',
+            arquivo,
+            timer_banco.elapsed,
+        )
+    else:
+        log.warning('Processamento concluído, mas a planilha não foi salva.')
 
 
 if __name__ == '__main__':
