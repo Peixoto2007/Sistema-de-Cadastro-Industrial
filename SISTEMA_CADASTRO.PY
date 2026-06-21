@@ -16,7 +16,7 @@ logging.basicConfig(
 )
 log = logging.getLogger(__name__)
 
-MODELO_IA = 'qwen2.5:1.5b'
+MODELO_IA = 'mistral:latest'
 LIMITE_SIMILARES = 8
 LIMIAR_SIMILARIDADE = 0.55
 LIMIAR_AUTO_MATCH = 0.78
@@ -37,8 +37,8 @@ MAPEAMENTO_COLUNAS_SAIDA = {
 }
 
 OLLAMA_OPTIONS = {
-    'num_predict': 150,
-    'temperature': 0.1,
+    'num_predict': 220,
+    'temperature': 0.15,
     'num_ctx': 4096,
 }
 
@@ -364,37 +364,43 @@ def interpretar_resposta_ia(conteudo):
     }
 
 
-def montar_prompt(descricao, similares_com_score):
-    return f"""Você decifra nomes abreviados de materiais industriais em português brasileiro.
+def montar_prompt(descricao, similares_com_score, reforco=False):
+    instrucao_extra = ''
+    if reforco:
+        instrucao_extra = """
+ATENÇÃO: sua resposta anterior repetiu o texto da nota. Agora DECODIFIQUE de verdade.
+Escreva o nome completo de cadastro industrial, como a empresa cadastraria o produto.
+"""
 
-TAREFA: expandir abreviações da nota fiscal para o nome completo de cadastro da empresa.
+    return f"""Você é um especialista em cadastro de materiais industriais no Brasil.
 
-REGRA PRINCIPAL: NUNCA repita o texto da nota. Sempre escreva o nome por extenso.
+Sua função é DECODIFICAR nomes abreviados de notas fiscais e orçamentos.
+Não basta trocar 1 ou 2 abreviações: interprete o produto e devolva o cadastro correto da empresa.
 
-Exemplos corretos:
-- "Pont. 200V retific." -> "Ponte retificadora 200V"
-- "tubo ret 10x30mm" -> "Tubo reto 10x30mm"
-- "Cab. pp 70mm" -> "Cabo polipropileno 70mm"
-- "Bomb. pneum s/bc pt" -> "Bomba pneumatica sem boca preta"
-- "cont. 24v/220w" -> "Contator 24V 220W"
-- "paraf sext 1/4" -> "Parafuso sextavado 1/4"
-- "tubo pa 6" -> "Tubo PA 6"
-- "Desinfetante alf. 12/500" -> "Desinfetante alfazema 12x500ml"
+REGRAS:
+1. NUNCA repita o texto da nota em "cadastro".
+2. Se o produto JÁ EXISTE no banco abaixo (mesmo item), use status JA_EXISTE, preencha "codigo" e deixe "cadastro" vazio.
+3. Se for material NOVO, use status NOVO e preencha "cadastro", "ncm" e "tipo".
+4. "tipo" deve ser unidade: UN, KG, MT, L, PC, CX ou RL.
+5. "ncm" deve ser código numérico NCM (somente dígitos).
 
-Abreviações comuns:
-Pont.=Ponte, retific.=retificadora, ret=reto, Cab.=Cabo, pp=polipropileno,
-Bomb.=Bomba, pneum.=pneumatica, cont.=contator, paraf.=parafuso,
-sext.=sextavado, alf.=alfazema, galv.=galvanizado, s/=sem, c/=com.
-
-Item da nota: {descricao}
+Exemplos de DECODIFICAÇÃO correta:
+- "Ch. comb. 1/2 a.c." -> cadastro: "Chave combinada 1/2 aco", tipo: UN
+- "VALV. BORB" -> cadastro: "Valvula borboleta", tipo: UN
+- "Disj. termomag. trip. 63a cur c" -> cadastro: "Disjuntor termomagnetico tripolar 63A curva C", tipo: UN
+- "Pont. 200V retific." -> cadastro: "Ponte retificadora 200V", tipo: UN
+- "tubo ret 10x30mm" -> cadastro: "Tubo reto 10x30mm", tipo: MT
+- "Rol. esfe. rad. 6204 2rs c3" -> cadastro: "Rolamento esferas radial 6204 2RS C3", tipo: UN
+- "Cab. pp 70mm" -> cadastro: "Cabo polipropileno 70mm", tipo: MT
+- "cont. 24v/220w" -> cadastro: "Contator 24V 220W", tipo: UN
+{instrucao_extra}
+Item da nota/orçamento:
+{descricao}
 
 Materiais parecidos no banco da empresa:
 {formatar_similares(similares_com_score)}
 
-Se o item JÁ EXISTE no banco (mesmo produto), use status JA_EXISTE, preencha codigo e deixe cadastro vazio.
-Se é material NOVO, use status NOVO, expanda o nome em cadastro, sugira ncm e tipo (UN/KG/MT/L/PC/CX/RL).
-
-Responda APENAS JSON puro:
+Responda APENAS JSON puro, sem markdown:
 {{"status":"JA_EXISTE ou NOVO","codigo":"","cadastro":"","ncm":"","tipo":""}}"""
 
 
@@ -407,17 +413,27 @@ def preaquecer_modelo():
         )
 
 
-def consultar_ia(descricao, similares_com_score):
-    prompt = montar_prompt(descricao, similares_com_score)
+def chamar_ia(descricao, similares_com_score, reforco=False):
+    prompt = montar_prompt(descricao, similares_com_score, reforco=reforco)
     log.info('Prompt: %d chars, ~%d tokens estimados', len(prompt), len(prompt) // 4)
     log.info('Similares: %d', len(similares_com_score))
 
     conteudo = ''
     for chunk in chat(
         model=MODELO_IA,
-        messages=[{'role': 'user', 'content': prompt}],
+        messages=[
+            {
+                'role': 'system',
+                'content': (
+                    'Você decodifica materiais industriais abreviados de notas fiscais. '
+                    'Responda somente JSON válido.'
+                ),
+            },
+            {'role': 'user', 'content': prompt},
+        ],
         stream=True,
         options=OLLAMA_OPTIONS,
+        format='json',
     ):
         pedaco = chunk.message.content or ''
         conteudo += pedaco
@@ -425,8 +441,54 @@ def consultar_ia(descricao, similares_com_score):
             print('.', end='', flush=True)
     print()
 
-    resultado = interpretar_resposta_ia(conteudo.strip())
-    return corrigir_cadastro_copiado(descricao, resultado)
+    return interpretar_resposta_ia(conteudo.strip())
+
+
+def buscar_linha_por_codigo(banco, codigo):
+    if not codigo_valido(codigo):
+        return None
+    match = banco[banco['codigo'].astype(str) == str(codigo)]
+    if match.empty:
+        return None
+    return match.iloc[0]
+
+
+def enriquecer_com_banco(resultado, banco, similares_com_score):
+    if resultado['status'] == 'JA_EXISTE' and codigo_valido(resultado['codigo']):
+        linha = buscar_linha_por_codigo(banco, resultado['codigo'])
+        if linha is not None:
+            return resultado_de_linha(linha)
+
+    if resultado['status'] != 'NOVO' or not similares_com_score:
+        return resultado
+
+    _, melhor = similares_com_score[0]
+    if not resultado['ncm']:
+        ncm_banco = validar_ncm(melhor.get('ncm', ''))
+        if ncm_banco:
+            resultado['ncm'] = ncm_banco
+
+    if not resultado['tipo']:
+        tipo_banco = formatar_valor_campo(melhor.get('tipo', ''))
+        if tipo_banco and parece_unidade(tipo_banco):
+            resultado['tipo'] = tipo_banco.upper()
+
+    return resultado
+
+
+def consultar_ia(descricao, similares_com_score, banco):
+    resultado = chamar_ia(descricao, similares_com_score, reforco=False)
+
+    if resultado['status'] == 'NOVO' and cadastro_parece_copia(descricao, resultado['cadastro']):
+        log.warning('IA repetiu texto da nota, tentando novamente com prompt reforçado')
+        resultado = chamar_ia(descricao, similares_com_score, reforco=True)
+
+    resultado = enriquecer_com_banco(resultado, banco, similares_com_score)
+
+    if resultado['status'] == 'NOVO' and cadastro_parece_copia(descricao, resultado['cadastro']):
+        log.warning('IA não decodificou o material: %s', descricao)
+
+    return resultado
 
 
 def cadastro_parece_copia(descricao, cadastro):
@@ -436,7 +498,7 @@ def cadastro_parece_copia(descricao, cadastro):
     cad_norm = normalizar(cadastro)
     if desc_norm == cad_norm:
         return True
-    return SequenceMatcher(None, desc_norm, cad_norm).ratio() >= 0.82
+    return SequenceMatcher(None, desc_norm, cad_norm).ratio() >= 0.78
 
 
 def expandir_abreviacoes_basicas(descricao):
@@ -467,19 +529,6 @@ def expandir_abreviacoes_basicas(descricao):
     if texto:
         return texto[0].upper() + texto[1:]
     return texto
-
-
-def corrigir_cadastro_copiado(descricao, resultado):
-    if resultado['status'] != 'NOVO':
-        return resultado
-    if not cadastro_parece_copia(descricao, resultado['cadastro']):
-        return resultado
-
-    expandido = expandir_abreviacoes_basicas(descricao)
-    if expandido and not cadastro_parece_copia(descricao, expandido):
-        resultado['cadastro'] = expandido
-        log.info('Cadastro corrigido por regras: %s', expandido)
-    return resultado
 
 
 def resultado_de_linha(linha, status='JA_EXISTE'):
@@ -558,7 +607,7 @@ def processar_material(descricao, banco, cache=None):
 
     try:
         t0 = time.perf_counter()
-        resultado = consultar_ia(descricao, similares_com_score)
+        resultado = consultar_ia(descricao, similares_com_score, banco)
         metricas['ollama'] = time.perf_counter() - t0
         metricas['origem'] = 'ia'
     except Exception as erro:
@@ -568,10 +617,12 @@ def processar_material(descricao, banco, cache=None):
         resultado = {
             'status': 'NOVO',
             'codigo': '',
-            'cadastro': expandir_abreviacoes_basicas(descricao) or str(descricao).upper(),
+            'cadastro': '',
             'ncm': '',
             'tipo': '',
         }
+        if similares_com_score:
+            resultado = enriquecer_com_banco(resultado, banco, similares_com_score)
 
     if cache is not None:
         cache[desc_norm] = resultado
